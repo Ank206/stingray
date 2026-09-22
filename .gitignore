@@ -1,0 +1,15 @@
+# Virtual environments
+venv/
+env/
+.env
+
+# Python compilation files
+__pycache__/
+*.pyc
+
+# Local project files
+.sdel/
+test_file.txt
+*.bin
+tests/
+test_vault/
