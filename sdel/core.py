@@ -56,7 +56,15 @@ def delete_file(filepath):
                     
                     # Atomic rename
                     tmp_path.rename(dest_path)
-                    
+                else:
+                    # CRITICAL CONCURRENCY FIX: Update mtime of existing chunks!
+                    # If this chunk was an old orphan (> 1 hour old), GC might sweep it
+                    # right before we commit to the DB. Touching it resets the 1-hour timer.
+                    try:
+                        os.utime(dest_path, None)
+                    except FileNotFoundError:
+                        raise RuntimeError(f"Concurrency conflict: Chunk {chunk_hash} was swept by GC. Please re-run the delete command.")
+                        
         full_file_hash = full_hasher.hexdigest()
         
         # Save to database
@@ -152,14 +160,17 @@ def restore_file(filepath):
             
             # AUTO-GC: Clean up orphaned chunks specifically for this file
             deleted_chunks = 0
+            now = time.time()
             for (chunk_hash,) in chunk_rows:
                 cursor.execute("SELECT 1 FROM file_chunks WHERE chunk_hash = ? LIMIT 1", (chunk_hash,))
                 if not cursor.fetchone():
                     # No other file needs this chunk
                     chunk_path = STORE_DIR / chunk_hash
                     if chunk_path.exists():
-                        chunk_path.unlink()
-                        deleted_chunks += 1
+                        # Concurrency Safety: Only delete if older than 1 hour
+                        if (now - chunk_path.stat().st_mtime) > 3600:
+                            chunk_path.unlink()
+                            deleted_chunks += 1
                         
             print(f"Auto-GC: Reclaimed {deleted_chunks} orphaned chunks from the vault.")
             

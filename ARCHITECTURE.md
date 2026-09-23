@@ -7,14 +7,14 @@
 1. **Never Lose Data:** Always strictly verify full-file hashes (SHA-256) upon restoration before finalizing deletes from the vault. 
 2. **Prevent Corruption:** All chunks are written using atomic `.tmp` renaming to prevent silent corruption from interrupted scripts.
 3. **Save Space:** Chunk-based Content Addressed Storage (CAS) with Zstandard achieves aggressive compression and deduplication on shared data.
-4. **Self-Healing GC:** Zero-RAM streaming Garbage Collection handles orphaned physical chunks safely using a 1-hour concurrency delay to prevent race conditions.
+4. **Self-Healing GC:** High-speed in-memory Garbage Collection handles orphaned physical chunks safely using a 1-hour concurrency delay to prevent race conditions.
 
 ## Components (`sdel/`)
 - `cli.py`: Uses `argparse` to route commands (`delete`, `restore`, `list`, `gc`, `stats`). Supports shell globbing (multiple files via `*`).
 - `core.py`: Contains the heavy lifting:
   - `delete_file`: Chunks the file (1MB), hashes, compresses (Zstd), deduplicates against existing hashes, writes atomically, and inserts DB records.
   - `restore_file`: Reconstructs the file from chunks, strictly checks `full_file_hash`, restores original permissions and timestamps, and runs an Auto-GC to prune the DB and orphaned chunks.
-  - `garbage_collect`: A two-phase Mark-and-Sweep. Prunes expired DB rows, then uses an $O(1)$ memory generator (`os.scandir`) to detect and unlink unreferenced physical chunks that are >1 hour old.
+  - `garbage_collect`: A two-phase Mark-and-Sweep. Prunes expired DB rows, then uses a high-speed Python `set` in memory to quickly detect and unlink unreferenced physical chunks that are >1 hour old without thrashing the disk.
   - `stats`: Analyzes `original_size` vs physical vault size to show space savings.
 - `db.py`: Bootstraps the SQLite relational schema.
 - `config.py`: Hardcoded paths and constants (`~/.sdel/`, `CHUNK_SIZE`).
