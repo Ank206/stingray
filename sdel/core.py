@@ -2,8 +2,9 @@ import sqlite3
 import hashlib
 import zstandard as zstd
 import os
+import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from .config import DB_PATH, STORE_DIR
 
 CHUNK_SIZE = 1024 * 1024  # 1MB
@@ -85,7 +86,7 @@ def delete_file(filepath):
         print(f"Failed to delete '{filepath}': {e}")
 
 def restore_file(filepath):
-    """Reconstructs a file from its chunks and verifies checksum."""
+    """Reconstructs a file, verifies checksum, and Auto-GCs the vault."""
     path = Path(filepath).resolve()
     
     with sqlite3.connect(DB_PATH) as conn:
@@ -134,8 +135,9 @@ def restore_file(filepath):
             actual_hash = full_hasher.hexdigest()
             
             if actual_size != expected_size or actual_hash != expected_hash:
-                print(f"CRITICAL ERROR: Data corruption detected in '{path}'. Hash mismatch!")
-                # Keep the file but warn the user
+                print(f"CRITICAL ERROR: Data corruption detected in '{path}'. Hash mismatch! Aborting restore.")
+                path.unlink()  # Delete the corrupted reconstructed file
+                return
             
             # Restore metadata
             path.chmod(permissions)
@@ -143,8 +145,89 @@ def restore_file(filepath):
             
             print(f"Successfully restored and verified: {path}")
             
+            # AUTO-GC: Remove from database
+            cursor.execute("DELETE FROM file_chunks WHERE file_id = ?", (file_id,))
+            cursor.execute("DELETE FROM deleted_files WHERE id = ?", (file_id,))
+            conn.commit()
+            
+            # AUTO-GC: Clean up orphaned chunks specifically for this file
+            deleted_chunks = 0
+            for (chunk_hash,) in chunk_rows:
+                cursor.execute("SELECT 1 FROM file_chunks WHERE chunk_hash = ? LIMIT 1", (chunk_hash,))
+                if not cursor.fetchone():
+                    # No other file needs this chunk
+                    chunk_path = STORE_DIR / chunk_hash
+                    if chunk_path.exists():
+                        chunk_path.unlink()
+                        deleted_chunks += 1
+                        
+            print(f"Auto-GC: Reclaimed {deleted_chunks} orphaned chunks from the vault.")
+            
         except Exception as e:
             print(f"Failed to restore '{filepath}': {e}")
+            if path.exists():
+                path.unlink() # Cleanup partial restore on error
+
+def restore_all_files():
+    """Restores all files currently in the vault."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT original_path FROM deleted_files")
+        rows = cursor.fetchall()
+        
+    if not rows:
+        print("Vault is empty. Nothing to restore.")
+        return
+        
+    for (path,) in rows:
+        restore_file(path)
+        
+def garbage_collect(days):
+    """Prunes DB records older than N days and sweeps physical orphans safely."""
+    cutoff = datetime.now() - timedelta(days=days)
+    cutoff_iso = cutoff.isoformat()
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        
+        # Phase 1: Database Pruning
+        cursor.execute("SELECT id FROM deleted_files WHERE deleted_at < ?", (cutoff_iso,))
+        expired_files = cursor.fetchall()
+        
+        if expired_files:
+            expired_ids = [row[0] for row in expired_files]
+            placeholders = ','.join('?' * len(expired_ids))
+            
+            cursor.execute(f"DELETE FROM file_chunks WHERE file_id IN ({placeholders})", expired_ids)
+            cursor.execute(f"DELETE FROM deleted_files WHERE id IN ({placeholders})", expired_ids)
+            conn.commit()
+            print(f"GC: Pruned {len(expired_ids)} old files from the database.")
+        else:
+            print(f"GC: No files older than {days} days to prune.")
+            
+        # Phase 2: High-Speed Orphan Sweeping
+        print("GC: Sweeping for orphaned physical chunks...")
+        cursor.execute("SELECT DISTINCT chunk_hash FROM file_chunks")
+        active_hashes = {row[0] for row in cursor.fetchall()}
+        
+        now = time.time()
+        one_hour_sec = 3600
+        reclaimed_space = 0
+        deleted_count = 0
+        
+        for entry in os.scandir(STORE_DIR):
+            if entry.is_file() and not entry.name.endswith('.tmp'):
+                # Is it an active hash?
+                if entry.name not in active_hashes:
+                    # Is it older than 1 hour? (Concurrency Safety)
+                    if (now - entry.stat().st_mtime) > one_hour_sec:
+                        reclaimed_space += entry.stat().st_size
+                        os.unlink(entry.path)
+                        deleted_count += 1
+                        
+        print(f"GC: Swept and deleted {deleted_count} orphaned chunks.")
+        print(f"GC: Reclaimed {reclaimed_space / (1024*1024):.2f} MB of physical space.")
+
 
 def list_files():
     """Lists all files currently stored in the vault."""
@@ -161,3 +244,35 @@ def list_files():
         print("-" * 100)
         for row in rows:
             print(f"{row[1]:<25} | {row[2]:<15} | {row[0]}")
+
+def stats():
+    """Calculates space savings and prints a report."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        
+        # 1. Logical size
+        cursor.execute("SELECT SUM(original_size) FROM deleted_files")
+        row = cursor.fetchone()
+        logical_size = row[0] if row and row[0] else 0
+        
+        # 2. Physical size
+        physical_size = 0
+        if STORE_DIR.exists():
+            for entry in os.scandir(STORE_DIR):
+                if entry.is_file() and not entry.name.endswith('.tmp'):
+                    physical_size += entry.stat().st_size
+                    
+        # 3. Math
+        savings_bytes = logical_size - physical_size
+        savings_percent = (savings_bytes / logical_size * 100) if logical_size > 0 else 0
+        ratio = (logical_size / physical_size) if physical_size > 0 else 0
+        
+        print("=== sdel Storage Statistics ===")
+        print(f"Logical Data Size : {logical_size / (1024*1024):>10.2f} MB")
+        print(f"Physical Vault Size: {physical_size / (1024*1024):>10.2f} MB")
+        print("-" * 31)
+        if logical_size > 0:
+            print(f"Total Space Saved : {savings_bytes / (1024*1024):>10.2f} MB ({savings_percent:.1f}%)")
+            print(f"Compression Ratio : {ratio:>10.2f}x")
+        else:
+            print("Vault is empty. Delete some files to see stats!")
